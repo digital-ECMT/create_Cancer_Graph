@@ -1,0 +1,579 @@
+---
+title: "getKEGGNetworks"
+author: "dECMT"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+##NOTE: the following packages are required to run this script, but should be installed (e.g. using code snippets below) before runnning the script, NOT as part of the script itself
+# options(repos = "http://cran.us.r-project.org")
+# install.packages("BiocManager")
+# BiocManager::install("AnnotationDbi")
+# BiocManager::install("org.Hs.eg.db")
+# BiocManager::install("KEGGREST")
+# BiocManager::install("KEGGlincs")
+# BiocManager::install("hgu133a.db")
+# BiocManager::install("drugTargetInteractions")
+require(KEGGlincs)        ## GPL-3
+require(KEGGgraph)        ## GPL >= 2
+require(KEGGREST)         ## Artistic 2.0
+require(dplyr)
+require(tidyr)
+require(formattable)
+require(kableExtra)
+require(stringr)
+require(neo4r)
+require(neo4jshell)
+require(httr)
+require(jsonlite)
+require(reticulate)
+require(purrr)
+require(corpus)
+require(quanteda)
+require(org.Hs.eg.db)
+
+## clean up
+rm(list=ls())
+```
+
+## **Objective**  
+  
+* Get gene/protein, compound relationships for cancer pathways from KEGG  
+  * Save node and egde lists as csv files  
+  * Update remote neo4j database  
+* Can be run periodically to update graph (without deleting whole graph first...)  
+
+    
+## **KEGG networks**  
+  
+### **Download pathways from KEGG**  
+  
+```{r download KGML files from KEGG}
+
+## PTEN-|PIP3 is not encoded within hsa05200 Pathways in Cancer (there, it is encoded as "missing interaction")
+## PTEN -| PIP3 is encoded within hsa04151 PI3K-AKT signalling pathway, however
+
+## hsa04151 is embedded within hsa05200
+
+## we can use the function parseKGMLexpandMaps() to parse hsa05200, download KGML files for embedded pathways from KEGG FTP website, parse them individually, and merge all the children pathway graphs with the parental pathway into one graph object. The graph is returned as the function value. 
+## first, we need to manually download and save KGML file
+# embedded_graph <- parseKGMLexpandMaps(file="hsa05200.xml", downloadmethod = "curl", genesOnly = FALSE)
+## however, the resulting graph object contains KEGG IDs as identifiers for nodes, and does not contain details for edges (e.g. inhibition etc)
+
+## alternatively, we can get the names of entries of TYPE "map" from pathway_mappings object, then use KEGGPATHID2NAME mapping in KEGGgraph to get IDs for embedded pathways
+## however, it is unclear how to implement this (?!)
+
+## for now, we will do this manually - based on the parseKGMLexpandMaps call above, we can see that the following pathways are embedded within pathways in cancer: 
+# "hsa04520", "hsa04310", "hsa04512", "hsa04060", "hsa04630", "hsa04010", "hsa04150", "hsa04210", "hsa04115", "hsa04110", "hsa04370", "hsa03320", "hsa04350", "hsa04510", "hsa04151", "hsa04024", "hsa04330", "hsa04340", "hsa04915", "hsa04066", "hsa04020"
+
+cancer_pathways <- c("hsa05200", "hsa05210", "hsa05212", "hsa05225", "hsa05226", "hsa05214", "hsa05216", "hsa05221", "hsa05220", "hsa05217", "hsa05218", "hsa05211", "hsa05219", "hsa05215", "hsa05213", "hsa05224", "hsa05222", "hsa05223")
+
+embedded_pathways <- c("hsa04520", "hsa04310", "hsa04512", "hsa04060", "hsa04630", "hsa04010", "hsa04150", "hsa04210", "hsa04115", "hsa04110", "hsa04370", "hsa03320", "hsa04350", "hsa04510", "hsa04151", "hsa04024", "hsa04330", "hsa04340", "hsa04915", "hsa04066", "hsa04020")
+
+combined_pathways <- unique(c(cancer_pathways, embedded_pathways))
+
+## initialise empty dataframes that will hold nodes and edges
+combined_nodelist <- NULL
+combined_edgelist <- NULL
+
+## and an empty dataframe that will hold pathway titles
+pathway_titles <- data.frame(kegg_pathway_id = character(0), pathway_title = character(0))
+
+## loop through set of pathway IDs and download graph data
+for(i in 1:length(combined_pathways)) {
+  pathway_id <- combined_pathways[i]
+  # print(pathway_id)
+  ## download KGML file 
+  pathway_KGML <- tryCatch({get_KGML(pathway_id)}, 
+                           error = function(cond) {return(NULL)})
+  if (is.null(pathway_KGML)) next   ## break this loop and go to next loop, i+1
+  ## get pathway title
+  pathwayTitle <- getTitle(pathway_KGML)
+  # print(pathwayTitle)
+  
+  ## add rows
+  pathway_titles <- pathway_titles %>%
+    dplyr::add_row(kegg_pathway_id = pathway_id, pathway_title = pathwayTitle)
+  ## expand mappings, convert KEGG IDs to Entrez Symbols
+  pathway_mappings <- expand_KEGG_mappings(pathway_KGML)
+  pathway_edges <- expand_KEGG_edges(pathway_KGML, pathway_mappings)
+
+  ## add "kegg_" as a prefix to accession numbers
+  pathway_edges$entry1accession <- paste0("kegg_", pathway_edges$entry1accession)
+  pathway_edges$entry2accession <- paste0("kegg_", pathway_edges$entry2accession)
+
+  ## create a simple edgelist
+  edgelist <- unique(dplyr::select(pathway_edges, "from"="entry1accession", "to"="entry2accession", "relationship_detail"="specific_subtype"))
+  # specify source
+  edgelist$source <- "KEGG"
+  
+  # create simple node list
+  nodelist <- unique(dplyr::select(pathway_edges, "entryACCESSION"="entry1accession", "entrez_symbol"="entry1symbol", "entryTYPE"="entry1type"))
+  nodelist2 <- unique(dplyr::select(pathway_edges, "entryACCESSION"="entry2accession", "entrez_symbol"="entry2symbol", "entryTYPE"="entry2type"))
+  nodelist <- unique(rbind(nodelist, nodelist2))
+  rm(nodelist2)
+  # specify source
+  nodelist$source <- "KEGG"
+  ## specify pathway
+  nodelist$pathway <- pathwayTitle
+  
+  ## bind onto combined lists
+  combined_nodelist <- unique(rbind(combined_nodelist, nodelist))
+  combined_edgelist <- unique(rbind(combined_edgelist, edgelist))
+}  
+  
+## clean up
+# rm(pathway_KGML)
+# rm(pathway_mappings)
+# rm(pathway_edges)
+```
+  
+* KEGG data for the following pathways have been downloaded and saved as a non-redundant set of nodes and edges:  
+  * `r formattable(pathway_titles)`  
+
+  
+* The following relationship types are included:  
+  * `r unique(combined_edgelist$relationship_detail)`  
+  
+* For simplicity and network reasoning, we will group these as follows:    
+  
+
+```{r specify grouping of relationship types}
+relationship_groupings <- data.frame(detail = unique(combined_edgelist$relationship_detail), 
+                                     relationship = "other")
+
+relationship_groupings$relationship[grep(pattern = "activation|expression", x=relationship_groupings$detail, ignore.case = T)] <- "activates"
+
+relationship_groupings$relationship[grep(pattern = "inhibition|repression", x=relationship_groupings$detail, ignore.case = T)] <- "inhibits"
+
+## add a LINK_FUNCTION attribute
+relationship_groupings$LINK_FUNCTION <- 0
+relationship_groupings$LINK_FUNCTION[relationship_groupings$relationship == "activates"] <- 1
+relationship_groupings$LINK_FUNCTION[relationship_groupings$relationship == "inhibits"] <- -1
+
+formattable(relationship_groupings)
+
+## join to edge list
+combined_edgelist <- unique(merge(x=combined_edgelist, by.x = "relationship_detail", all.x = TRUE, y=relationship_groupings, by.y = "detail"))
+```
+  
+* **We will omit all of the following relationships:**  
+  * ***detail* = *activation_inhibition* as this is ambiguous**  
+
+```{r omit relationships}
+combined_edgelist <- unique(dplyr::filter(combined_edgelist, relationship_detail != "activation_inhibition"))
+
+# combined_edgelist <- unique(dplyr::filter(combined_edgelist, relationship != "other"))
+
+```
+
+* Where there is >1 relationship remaining between two given nodes, these are aggregated in pipe-delimited format  
+
+```{r group combined_edgelist}
+## for a given relationship, there may be >1 relationship_detail
+combined_edgelist <- combined_edgelist %>%
+  group_by(across(-c(relationship_detail))) %>%
+  summarise(
+    relationship_detail = paste(unique(na.omit(relationship_detail)), collapse = "|") 
+  ) %>%
+  as.data.frame()
+
+
+## reorder columns
+combined_edgelist <- unique(dplyr::select(combined_edgelist, from, to, relationship, relationship_detail, source, LINK_FUNCTION))
+```
+  
+  
+### **Add metadata to node lists**  
+   
+* Classify genes as tumour suppressors or oncogenes based on Intogen annotations  
+  
+```{r get intogen annotations}
+
+compendium_url <- "https://www.intogen.org/download?file=IntOGen-Drivers-20200201.zip"
+
+## download, extract the file from this URL and save Compendium_Cancer)Genes.tsv to the working directory...
+
+compendium <- read.table("Compendium_Cancer_Genes.tsv", sep="\t", quote="", fill = TRUE, stringsAsFactors = FALSE, header = TRUE)
+
+## we just need the ROLE column, defined in README file as follows: 
+## ROLE: Consensus mode of action of the gene. Derived from intOGen and from literature. LoF (Loss of Function), Act (Activating) or amb (Ambiguous). 
+## also this in the web front end: "Predicted ROLE in pancancer analysis (Actviating for oncogens, loss of function for tumour suppressors, and ambiguous when the estimation is in the twilight zone"
+
+## select columns of interest
+compendium <- unique(dplyr::select(compendium, SYMBOL, ROLE))
+
+## reword ROLE values
+compendium$ROLE <- gsub(pattern = "Act", replacement = "ONCOGENE", x=compendium$ROLE)
+compendium$ROLE <- gsub(pattern = "ambiguous", replacement = "AMBIGUOUS", x=compendium$ROLE)
+compendium$ROLE <- gsub(pattern = "LoF", replacement = "TUMOUR SUPPRESSOR", x=compendium$ROLE)
+
+# compendium <- rename(compendium, "driver_mechanism"="ROLE")
+
+compendium <- unique(dplyr::filter(compendium, ROLE != "AMBIGUOUS"))
+
+
+## check which of the 4 genes from test case are included
+intersect(c("ARID1A", "BRAF", "KRAS", "PIK3CA"), compendium$SYMBOL)
+
+```
+
+```{r join intogen annotations to nodelist}
+## left join to cancerNodes, keeping all nodes, including those (e.g. compounds) that don't map to an OMIM ID
+combined_nodelist <- unique(merge(x=combined_nodelist, by.x = "entrez_symbol", all.x = TRUE, y=compendium, by.y = "SYMBOL", all.y=FALSE))
+
+```
+
+   
+* OMIM IDs (where applicable) will be included as additional metadata for KEGG nodes.  
+  * Where there is >1 OMIM ID for a given node, these are aggregated in pipe-delimited format  
+  * Where a node participates in >1 pathway, pathways are aggregated in pipe-delimited format  
+    
+```{r get OMIM and UniProt IDs for KEGG entities}
+
+## get OMIM IDs for all nodes based on Entrez Symbol
+# first, define columns...
+# cols <- c("SYMBOL", "GENENAME", "ENSEMBL", "OMIM", "UNIPROT)
+cols <- c("SYMBOL", "OMIM", "UNIPROT" )
+omimIDs <- as.data.frame(AnnotationDbi::select(org.Hs.eg.db, keys=combined_nodelist$entrez_symbol, columns=cols, keytype="SYMBOL"))
+
+## left join to cancerNodes, keeping all nodes, including those (e.g. compounds) that don't map to an OMIM ID
+combined_nodelist <- unique(merge(x=combined_nodelist, by.x = "entrez_symbol", all.x = TRUE, y=omimIDs, by.y = "SYMBOL", all.y=FALSE))
+
+rm(omimIDs)
+
+## note that there may be >1 OMIM ID for each gene... 
+# group OMIM IDs into a single row per gene, pipe-delimited
+combined_nodelist <- combined_nodelist %>%
+  # group_by(entryACCESSION, entrez_symbol) %>%
+  group_by(across(-c(OMIM, UNIPROT, pathway))) %>%
+  summarise(
+    OMIM = paste(unique(na.omit(OMIM)), collapse = "|"), 
+    UNIPROT = paste(unique(na.omit(UNIPROT)), collapse = "|"), 
+    pathway = paste(unique(na.omit(pathway)), collapse = "|")
+  ) %>%
+  as.data.frame()
+
+## reorder columns
+
+combined_nodelist <- unique(dplyr::select(combined_nodelist, entryACCESSION, entrez_symbol, entryTYPE, OMIM, UNIPROT, ROLE, pathway, source))
+
+```
+  
+* We will define additional node attributes as follows:  
+  * *activity*, assigned a value of 1  
+  * *deviation*, assigned a value of 0  
+  * *label*, duplicating *entrez_symbol* value  
+  
+
+```{r create activity attribute for nodes}
+## if network effects are multiplicative (e.g. AKT2 effect on MTOR multiplies effect of AKT1 on MTOR), define baseline activity as 1 and then multiply accordingly...
+combined_nodelist$activity <- 1
+
+## if network effects are additive (e.g. AKT2 effect on MTOR is added to AKT1 effect on MTOR), define baseline deviation as 0, then add/delete accordingly
+combined_nodelist$deviation <- 0
+
+combined_nodelist$label <- combined_nodelist$entrez_symbol
+```
+
+### **Save to CSV**  
+  
+* KEGG node and edge lists have been saved to csv files in the following format:  
+  
+```{r replace empty strings with NA}
+## Replace on all columns
+combined_nodelist[combined_nodelist == ''] <- NA
+combined_edgelist[combined_edgelist == ''] <- NA
+
+```
+
+
+```{r indicate refresh date}
+##get today's date
+today <- format(Sys.Date(), format = "%d %B %Y")
+combined_nodelist$refresh_date <- today
+combined_edgelist$refresh_date <- today
+
+```
+
+  
+```{r save edge and node lists to csv}
+## write to csv
+write.csv(x=combined_nodelist, file = "kegg_nodes.csv", row.names = FALSE)
+write.csv(x=combined_edgelist, file = "kegg_edges.csv", row.names = FALSE)
+
+## preview
+formattable(head(combined_edgelist))
+
+formattable(head(combined_nodelist))
+```
+
+* Collectively, this KEGG network includes **`r nrow(combined_edgelist)` relationships between `r length(unique(combined_nodelist$entrez_symbol))` nodes**  
+  
+### **Upload CSV files to neo4j server**  
+    
+```{r load credentials from JSON file}
+## load credentials data from JSON file
+neo4j_credentials <- jsonlite::fromJSON(txt = "neo4j_credentials.json")
+
+neo4j_folder_path <- neo4j_credentials$neo4j_folder_path
+neo4j_home_directory_address <- neo4j_credentials$neo4j_home_directory_address
+neo4j_base_url <- neo4j_credentials$neo4j_base_url
+neo4j_username <- neo4j_credentials$neo4j_username
+neo4j_password <- neo4j_credentials$neo4j_password
+
+```
+  
+* Upload csv file over SSH to directory where they can be ingested into neo4j database  
+  
+```{r upload csv files to remote location}
+
+## copy csv files to home directory on remote maching hosting neo4j database... 
+
+csv_filenames <- c("kegg_edges.csv", "kegg_nodes.csv")
+
+for(i in 1:length(csv_filenames)) {
+  filename <- csv_filenames[i]
+  ## copy csv file to home directory on remote maching hosting neo4j database...
+  scp_string1 <- paste("scp", 
+                       filename, 
+                       neo4j_home_directory_address, 
+                       sep = " ")
+  system(scp_string1)
+  ## sudo copy that file from home directory to correct folder for loading into neo4j...
+  scp_string2 <- paste('ssh', 
+      neo4j_home_directory_address, 
+      '"sudo cp', 
+      filename,
+      neo4j_folder_path,
+      '"',
+      sep = " ")
+  system(scp_string2)
+}
+
+```
+
+
+### **Connect to remote DB**  
+  
+```{r connection credentials}
+base_url <- neo4j_base_url
+
+username <-  neo4j_username
+password <- neo4j_password
+
+test_query <- "MATCH(g:gene)
+WHERE g.entryACCESSION = 'kegg_3845'
+RETURN g"
+```
+
+```{r run test cypher query using neo4jshell}
+## REQUIRES INSTALLATION OF CYPHER SHELL (in this case, in working directory)
+shell_path <- paste(getwd(), "cypher-shell", "cypher-shell.bat", sep = "/")
+
+## run a test query
+neo4j_query(
+    con = list(address = base_url, uid = username, pwd = password),
+    qry = test_query,
+    shell_path = shell_path,
+    database = "neo4j",
+)
+
+```
+
+### **Merge KEGG nodes into neo4j DB**  
+  
+```{r load nodelist into neo4j}
+
+path_to_kegg_nodes <- "file:///Network_reasoning/kegg_nodes.csv"
+
+## using apoc.MERGE.node ... 
+## look for each kegg node... 
+## if it doesn't already exist, create one with the defined attributes... 
+## define query
+cypher_MergeKeggNodes <- paste0("LOAD CSV WITH HEADERS FROM '", 
+                                 path_to_kegg_nodes,
+                                 "' AS nodes 
+                                 WITH nodes 
+        CALL apoc.merge.node([nodes.entryTYPE],
+            {label:nodes.label,
+            entryACCESSION:nodes.entryACCESSION,
+            entrez_symbol:nodes.entrez_symbol,
+            role:nodes.ROLE,
+            entryTYPE:nodes.entryTYPE,
+            source:nodes.source,
+            OMIM:split(nodes.OMIM,'|'),
+            UNIPROT:split(nodes.UNIPROT,'|'),
+            activity:nodes.activity,
+            deviation:nodes.deviation
+            },
+            {refresh_date: nodes.refresh_date, pathway:nodes.pathway},
+            {refresh_date: nodes.refresh_date, pathway:nodes.pathway}
+            )
+        YIELD node
+        RETURN null")
+
+                     
+## run query
+neo4j_query(
+    con = list(address = base_url, uid = username, pwd = password),
+    qry = cypher_MergeKeggNodes,
+    shell_path = shell_path,
+    database = "neo4j",
+)
+
+
+
+```
+
+### **Merge KEGG edges into neo4j DB**  
+  
+```{r merge kegg edges into neo4j DB}
+
+path_to_kegg_edges <- "file:///Network_reasoning/kegg_edges.csv"
+
+## if edges don't exist, create them... 
+cypher_MergeKeggEdges <- paste0("LOAD CSV WITH HEADERS FROM '",path_to_kegg_edges,"' AS edges
+                                 MATCH (n1) WHERE edges.from = n1.entryACCESSION
+                                 MATCH (n2) WHERE edges.to = n2.entryACCESSION
+                                 CALL {WITH n1, n2, edges
+                                 CALL apoc.merge.relationship(n1,edges.relationship,
+                                {LINK_FUNCTION:edges.LINK_FUNCTION}, 
+                                {relationship_detail:edges.relationship_detail, LINK_FUNCTION:edges.LINK_FUNCTION, source:edges.source, refresh_date:edges.refresh_date}, 
+                                n2, 
+                                {refresh_date:edges.refresh_date}
+                                )
+YIELD rel
+RETURN NULL}
+RETURN null")
+
+## run query
+neo4j_query(
+    con = list(address = base_url, uid = username, pwd = password),
+    qry = cypher_MergeKeggEdges,
+    shell_path = shell_path,
+    database = "neo4j",
+)
+
+
+```
+
+   
+`r knitr::knit_exit()`  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+## **Variant-gene relationships**  
+  
+* Clinvar includes detailed information for approx 75 variants for each gene  
+* When creating a graph, this means that there are many more variant:gene relationships compared with gene:gene relationships, which creates performance issues (in the absence of optimisation)  
+* for proof of concept, a generic type of variant for each gene (e.g. KRAS GoF or PTEN LoF) will be sufficient  
+* This information is available from Intogen at: https://www.intogen.org/download  
+  
+  
+```{r load kegg nodes of interest from csv}
+## we are only interested in variants that relate to nodes in the graph 
+
+# load csv
+# kegg_nodes <- read.csv(file = "kegg_nodes.csv", header = TRUE, stringsAsFactors = FALSE)
+## we will map rfom variants to gene based on (Entrez) symbol, so just get the set of gene symbols for the nodes
+
+kegg_node_symbols <- unique(combined_nodelist$entrez_symbol)
+
+
+## check which of the 4 genes from test case are included
+intersect(c("ARID1A", "BRAF", "KRAS", "PIK3CA"), kegg_node_symbols)
+```
+
+```{r create simple variant node list}
+
+simple_variant_nodes <- unique(dplyr::select(compendium, "entrez_symbol"="SYMBOL", "driver_mechanism"="ROLE"))
+
+## replace driver_mechanism values with GoF or LoF
+simple_variant_nodes$driver_mechanism[simple_variant_nodes$driver_mechanism == "ONCOGENE"] <- "GoF"
+simple_variant_nodes$driver_mechanism[simple_variant_nodes$driver_mechanism == "TUMOUR SUPPRESSOR"] <- "LoF"
+
+
+## add a label that will be used in neo4j
+simple_variant_nodes$label <- paste(simple_variant_nodes$entrez_symbol, simple_variant_nodes$driver_mechanism, sep = " ")
+
+## filter out rows where driver_mechanism is unknown
+simple_variant_nodes <- unique(dplyr::filter(simple_variant_nodes, driver_mechanism %in% c("GoF", "LoF")))
+
+## check which of the 4 genes from test case are included
+intersect(c("ARID1A", "BRAF", "KRAS", "PIK3CA"), simple_variant_nodes$entrez_symbol)
+```
+
+```{r create simple variant edge list}
+
+simple_variant_edges <- unique(dplyr::select(simple_variant_nodes, "from"="label", "to"="entrez_symbol", driver_mechanism))
+
+## assign a value for relationship based on whether driver is GoF or LoF... 
+simple_variant_edges$relationship[simple_variant_edges$driver_mechanism == "GoF"] <- "activates"
+simple_variant_edges$relationship[simple_variant_edges$driver_mechanism == "LoF"] <- "inhibits"
+
+
+## add LINK_FUNCTION column
+simple_variant_edges$LINK_FUNCTION <- 0
+simple_variant_edges$LINK_FUNCTION[simple_variant_edges$driver_mechanism == "GoF"] <- 1
+simple_variant_edges$LINK_FUNCTION[simple_variant_edges$driver_mechanism == "LoF"] <- -1
+
+```
+
+* Simple node and edge lists have been saved to CSV in the following format:  
+  
+```{r save simple node and edge lists to csv}
+## write to csv
+write.csv(x=simple_variant_nodes, file = "variant_nodelist_intogen.csv", row.names = FALSE)
+
+## preview
+formattable(head(simple_variant_nodes))
+
+
+## write to csv
+write.csv(x=simple_variant_edges, file = "variant_edgelist_intogen.csv", row.names = FALSE)
+
+## preview
+formattable(head(simple_variant_edges))
+```
+  
+  
+  
+  
+  

@@ -1,0 +1,273 @@
+---
+title: "Get drug target edges from IUPHAR"
+author: "dECMT"
+date: '`r Sys.Date()`'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+require(dplyr)
+require(tidyr)
+
+require(neo4r)
+require(neo4jshell)
+
+rm(list=ls())
+
+##get today's date
+today <- format(Sys.Date(), format = "%d %B %Y")
+
+```
+
+* Although CHEMBL is comprehensive, it does not include MTOR as a target for Everolimus (only FKBP1A)  
+* There are likely to be other examples  
+* Therefore, supplement drug->target edges from CHEMBL with data from other sources - this case, IUPHAR  
+  * See descriptions for downloads here: https://www.guidetopharmacology.org/DATA/file_descriptions.txt  
+* No need to create new nodes, as almost all relevant drugs will be represented already in NCI thesaurus (?)  
+* We can inject these into the neo4j graph using MERGE, ON CREATE and ON MATCH cypher queries (https://neo4j.com/docs/cypher-manual/current/clauses/merge/#:~:text=true-,Merge%20with%20ON%20CREATE%20and%20ON%20MATCH,-Query )  
+* (Note VS-6766 does not appear in NCI thesaurus, CHEMBL or IUPHAR...)  
+
+  
+```{r download interactions from IUPHAR }
+IUPHAR_interactions_url <- "https://www.guidetopharmacology.org/DATA/interactions.csv"
+iuphar_interactions <- read.csv(IUPHAR_interactions_url, skip = 1:1)      ## first row is date refreshed, not a header
+
+
+## manually download the file from above URL and add to public repo on GitHub where neo4j can access it... 
+# IUPHAR_interactions_url <- "https://raw.githubusercontent.com/digital-ECMT/network_data/main/interactions.csv"
+
+
+## get ligand id mappings
+iuphar_ligand_id_mappings <- read.csv("https://www.guidetopharmacology.org/DATA/ligand_id_mapping.csv", skip = 1:1)      ## first row is date refreshed, not a header
+
+
+
+```
+
+```{r process iuphar interactions}
+
+iuphar_processed <- dplyr::select(iuphar_interactions, "drug_name"=Ligand, Ligand.ID, Target.UniProt.ID, "action_type"="Type", Selectivity, Primary.Target)
+
+## join to molecule ChEMBL IDs 
+iuphar_processed <- merge(x=dplyr::select(iuphar_ligand_id_mappings, ChEMBl.ID, Ligand.id), by.x = "Ligand.id", 
+                          y=iuphar_processed, by.y = "Ligand.ID")
+
+## harmonise action type values with those loaded into neo4j... 
+action_types <- data.frame("parent_action_type"=character(0), 
+                           "action_type"=character(0)) %>%
+  add_row(parent_action_type = "NEGATIVE MODULATOR", action_type = "Antagonist") %>%
+  add_row(parent_action_type = "NEGATIVE MODULATOR", action_type = "Inhibitor") %>%
+  add_row(parent_action_type = "NEGATIVE MODULATOR", action_type = "Gating inhibitor") %>%
+  add_row(parent_action_type = "NEGATIVE MODULATOR", action_type = "Channel blocker") %>%
+  add_row(parent_action_type = "POSITIVE MODULATOR", action_type = "Agonist") %>%
+  add_row(parent_action_type = "POSITIVE MODULATOR", action_type = "Activator") 
+
+## join parent_action_type values
+iuphar_processed <- merge(x=iuphar_processed, by.x = "action_type", 
+                          y=action_types, by.y = "action_type")
+
+## select and reorder columns
+iuphar_processed <- unique(dplyr::select(iuphar_processed, "drug_chembl_id"="ChEMBl.ID", "target_uniprot_id"="Target.UniProt.ID", action_type, parent_action_type, "disease_efficacy"="Primary.Target"))
+
+iuphar_processed$disease_efficacy <- as.logical(iuphar_processed$disease_efficacy)
+
+## add extra columns for consistency with other drug-target edges in neo4j
+iuphar_processed$LINK_FUNCTION <- case_when(
+    iuphar_processed$parent_action_type == "POSITIVE MODULATOR" ~ 1,
+    iuphar_processed$parent_action_type == "NEGATIVE MODULATOR" ~ -1,
+    TRUE ~ 0
+)
+# indicate source
+iuphar_processed$source <- "IUPHAR"
+# indicate refresh date
+iuphar_processed$refresh_date <- today
+
+
+## drop rows where there is no chembl id
+iuphar_processed <- iuphar_processed[iuphar_processed$drug_chembl_id != "", ]
+## drop rows where there is no target uniprot id
+iuphar_processed <- iuphar_processed[iuphar_processed$target_uniprot_id != "", ]
+
+## some entries have >1 uniprot id, pipe-delimited
+# split and unnest
+iuphar_processed$target_uniprot_id <- strsplit(iuphar_processed$target_uniprot_id, split = "\\|")
+iuphar_processed <- tidyr::unnest(data = iuphar_processed, target_uniprot_id)
+iuphar_processed <- as.data.frame(iuphar_processed)
+```
+
+```{r write iuphar_processed to csv}
+
+write.csv(x=iuphar_processed, file = "iuphar_processed.csv", row.names = FALSE)
+```
+
+### **Upload CSV files to neo4j server**  
+    
+```{r load credentials from JSON file}
+## load credentials data from JSON file
+neo4j_credentials <- jsonlite::fromJSON(txt = "neo4j_credentials.json")
+
+neo4j_folder_path <- neo4j_credentials$neo4j_folder_path
+neo4j_home_directory_address <- neo4j_credentials$neo4j_home_directory_address
+neo4j_base_url <- neo4j_credentials$neo4j_base_url
+neo4j_username <- neo4j_credentials$neo4j_username
+neo4j_password <- neo4j_credentials$neo4j_password
+
+```
+  
+* Upload csv file over SSH to directory where they can be ingested into neo4j database  
+
+
+```{r upload iuphar_processed csv file to remote location NOT USED}
+
+# ## copy csv files to home directory on remote maching hosting neo4j database... 
+# # system("scp kegg_edges.csv decmt_por@20.90.21.60:")
+# # ## sudo copy that file from home directory to correct folder for loading into neo4j... 
+# # system('ssh decmt_por@20.90.21.60 "sudo cp kegg_edges.csv /root/docker/neo4j/neo4jr/import/Network_reasoning/"')
+# 
+# csv_filenames <- c("kegg_edges.csv", "kegg_nodes.csv", "simple_variant_nodes.csv", "simple_variant_edges.csv", "CIVIC_drug_nodes.csv", "CIVIC_drug_edges.csv")
+# 
+# for(i in 1:length(csv_filenames)) {
+#   filename <- csv_filenames[i]
+#   ## copy csv file to home directory on remote maching hosting neo4j database...
+#   scp_string1 <- paste0("scp ", filename, " decmt_por@20.90.21.60:")
+#   system(scp_string1)
+#   ## sudo copy that file from home directory to correct folder for loading into neo4j...
+#   scp_string2 <- paste0('ssh decmt_por@20.90.21.60 "sudo cp ', filename,' /root/docker/neo4j/neo4jr/import/Network_reasoning/"')
+#   system(scp_string2)
+# }
+# 
+# filename <- "iuphar_processed.csv"
+# ## copy csv file to home directory on remote machine hosting neo4j database...
+# scp_string1 <- paste0("scp ", filename, " decmt_por@20.90.21.60:")
+# system(scp_string1)
+# ## sudo copy that file from home directory to correct folder for loading into neo4j...
+# scp_string2 <- paste0('ssh decmt_por@20.90.21.60 "sudo cp ', filename,' /root/docker/neo4j/neo4jr/import/Network_reasoning/"')
+# system(scp_string2)
+```
+  
+```{r upload csv files to remote location}
+
+## copy csv files to home directory on remote machine hosting neo4j database... 
+
+csv_filenames <- c("iuphar_processed.csv")
+
+for(i in 1:length(csv_filenames)) {
+  filename <- csv_filenames[i]
+  ## copy csv file to home directory on remote maching hosting neo4j database...
+  scp_string1 <- paste0("scp ", 
+                       filename, 
+                       " ",
+                       neo4j_home_directory_address, ":")
+  system(scp_string1)
+  ## sudo copy that file from home directory to correct folder for loading into neo4j...
+  scp_string2 <- paste('ssh', 
+      neo4j_home_directory_address, 
+      '"sudo cp', 
+      filename,
+      neo4j_folder_path,
+      '"',
+      sep = " ")
+  system(scp_string2)
+}
+
+```
+
+### **Connect to remote DB**  
+  
+```{r connection credentials}
+# base_url <- "bolt+s://neo4jr.digitalecmt.com:17690"
+base_url <- "bolt://neo4jr.digitalecmt.com:17690"
+
+username <-  "neo4j"
+password <- "marina-sparta-finland-food-precise-5347"
+
+test_query <- "MATCH(g:gene)
+WHERE g.entryACCESSION = 'kegg_3845'
+RETURN g"
+```
+
+```{r run test cypher query using neo4jshell}
+## REQUIRES INSTALLATION OF CYPHER SHELL (in this case, in working directory)
+shell_path <- paste(getwd(), "cypher-shell", "cypher-shell.bat", sep = "/")
+
+## run a test query
+neo4j_query(
+    con = list(address = base_url, uid = username, pwd = password),
+    qry = test_query,
+    shell_path = shell_path,
+    database = "neo4j",
+)
+
+```
+
+
+```{r upload to neo4j}
+## look for each pair of drug and target nodes... 
+
+## if a relationship doesn't already exist, create one with the defined attributes... 
+# MATCH (d:drug), (t:gene)
+# WHERE 'CHEMBL3586573' IN d.chembl_id AND 'P42345' IN t.UNIPROT
+# MERGE (d)-[r:`NEGATIVE MODULATOR`]->(t)
+#     ON CREATE SET r.source = 'IUPHAR test', r.action_type = 'INHIBITOR'
+
+# upload_iuphar_edges_query <- "MATCH (d:drug), (t:gene)
+# WHERE 'CHEMBL3586573' IN d.chembl_id AND 'P42345' IN t.UNIPROT
+# MERGE (d)-[r:`NEGATIVE MODULATOR`]->(t)
+#     ON CREATE SET r.source = 'IUPHAR test', r.action_type = 'INHIBITOR'"
+
+
+
+path_to_edges <- "file:///Network_reasoning/iuphar_processed.csv"
+## note we are using apoc.MERGE.relationship ... 
+
+                                 
+  
+
+## if edges don't exist, create them... 
+cypher_MergeIUPHAREdges <- paste0("LOAD CSV WITH HEADERS FROM '",path_to_edges,"' AS edges
+                                 MATCH (n1:drug) WHERE edges.drug_chembl_id IN n1.chembl_id
+                                 MATCH (n2:gene) WHERE edges.target_uniprot_id IN n2.UNIPROT
+                                 CALL {WITH n1, n2, edges
+                                 CALL apoc.merge.relationship(n1,edges.parent_action_type,
+                                {LINK_FUNCTION:edges.LINK_FUNCTION}, 
+                                {action_type:edges.action_type, disease_efficacy:edges.disease_efficacy, source:edges.source, LINK_FUNCTION:edges.LINK_FUNCTION, refresh_date:edges.refresh_date}, 
+                                n2, 
+                                {action_type:edges.action_type, disease_efficacy:edges.disease_efficacy, source:edges.source, LINK_FUNCTION:edges.LINK_FUNCTION, refresh_date:edges.refresh_date}
+                                )
+YIELD rel
+RETURN NULL}
+RETURN null")
+
+## only issue with this is, if the edge already exists (e.g. from NCI thesaurus, the source property of the edge will be set to "IUPHAR", not ["NCIt", "IUPHAR"])
+# potentially used coalesce function, as described here: https://groups.google.com/g/neo4j/c/bY5GXWYpM1k#:~:text=%EE%97%93-,Russell%20Duhon,-unread%2C 
+                              
+
+neo4j_query(
+    con = list(address = base_url, uid = username, pwd = password),
+    qry = cypher_MergeIUPHAREdges,
+    shell_path = shell_path,
+    database = "neo4j",
+)
+
+
+## test
+neo4j_query(
+    con = list(address = base_url, uid = username, pwd = password),
+    qry = "MATCH path = (d:drug)-[r]->(t:gene)
+WHERE r.source = 'IUPHAR'
+    RETURN path LIMIT 1",
+    shell_path = shell_path,
+    database = "neo4j",
+)
+
+```
+
+
+`r knitr::knit_exit()`  
+
+
+  
+
+

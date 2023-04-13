@@ -1,0 +1,615 @@
+---
+title: "Get drug target data"
+author: "dECMT"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(httr)
+require(jsonlite)
+require(tictoc)
+require(DBI)              ## LGPL-2.1 | LGPL-3 
+require(RODBC)            ## GPL-2 | GPL-3
+# require(RPostgres)        ## GPL-3
+require(RSQLite)          ## LGPL-2.1 | LGPL-3
+require(dplyr)
+require(tidyr)
+require(org.Hs.eg.db)
+require(formattable)
+
+rm(list=ls())
+
+##get today's date
+today <- format(Sys.Date(), format = "%d %B %Y")
+```
+
+## **Objective**  
+  
+* Get drugs and drug-target relationships for cancer drugs from NCI thesaurus  
+  * Save node and egde lists as csv files  
+  * Update remote neo4j database  
+* Can be run periodically to update graph (without deleting whole graph first...)  
+
+
+```{r download CHEMBL as SQLite database}
+
+## note this: You will need around 35GB of free space available to import the ChEMBL dump files. (https://chembl.gitbook.io/chembl-interface-documentation/frequently-asked-questions/chembl-download-questions)
+
+## see here for schema: https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/latest/chembl_32_schema.png
+## and here for schema documentation: https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/latest/schema_documentation.txt 
+
+chembl_db_filename <- "chembl_32/chembl_32_sqlite/chembl_32.db"
+
+if(!file.exists(chembl_db_filename)) {
+  chembl_download_url <- "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/latest/chembl_32_mysql.tar.gz"
+  destfile <- "chembl_32_sqlite.tar.gz"
+  tic("download CHEMBL DB...")
+  download.file(url=chembl_download_url,destfile = destFlatFilename)
+  toc()
+  untar(destfile,list=TRUE)  ## list files without extracting
+  untar(destfile,list=TRUE)  ## extract files
+}
+
+
+con <- dbConnect(RSQLite::SQLite(), chembl_db_filename)
+# dbListTables(con)
+
+```
+
+```{r read data from tables}
+# COMPONENT_SYNONYMS <- dbGetQuery(con, "SELECT * FROM COMPONENT_SYNONYMS")         ## Table storing synonyms for the components of molecular targets
+# dim(COMPONENT_SYNONYMS)       ## 104,000 rows
+# 
+# DRUG_INDICATION <- dbGetQuery(con, "SELECT * FROM DRUG_INDICATION")           ## Table storing indications for drugs, and clinical candidate drugs, from a variety of sources (e.g., ATC, DailyMed, ClinicalTrials.gov)
+
+DRUG_MECHANISM <- dbGetQuery(con, "SELECT * FROM DRUG_MECHANISM")           ## Table storing mechanism of action information for drugs, and clinical candidate drugs, from a variety of sources (e.g., ATC, FDA, ClinicalTrials.gov)
+
+DRUG_WARNING <- dbGetQuery(con, "SELECT * FROM DRUG_WARNING")           ## Table storing safety-related information for drugs and clinical candidates
+
+MOLECULE_DICTIONARY <- dbGetQuery(con, "SELECT * FROM MOLECULE_DICTIONARY")           ## Table storing a non-redundant list of curated compounds for ChEMBL (includes preclinical compounds, drugs and clinical candidate drugs) and some associated attributes
+
+MOLECULE_SYNONYMS <- dbGetQuery(con, "SELECT * FROM MOLECULE_SYNONYMS")           ## Stores synonyms for a compound (e.g., common names, trade names, research codes etc)
+
+TARGET_DICTIONARY <- dbGetQuery(con, "SELECT * FROM TARGET_DICTIONARY")           ## Target Dictionary containing all curated targets for ChEMBL. Includes both protein targets and non-protein targets (e.g., organisms, tissues, cell lines)
+
+ACTION_TYPE <- dbGetQuery(con, "SELECT * FROM ACTION_TYPE")           ## Table storing the distinct list of action types used in the drug_mechanism table, together with a higher-level parent action type.
+
+COMPONENT_SEQUENCES <- dbGetQuery(con, "SELECT * FROM COMPONENT_SEQUENCES")           ## Table storing the sequences for components of molecular targets (e.g., protein sequences), along with other details taken from sequence databases (e.g., names, accessions). Single protein targets will have a single protein component in this table, whereas protein complexes/protein families will have multiple protein components
+
+TARGET_COMPONENTS  <- dbGetQuery(con, "SELECT * FROM TARGET_COMPONENTS")           ## Links molecular target from the target_dictionary to the components they consist of (in the component_sequences table). For a protein complex or protein family target, for example, there will be multiple protein components in the component_sequences table
+```
+
+```{r download and process NCI thesaurus}
+
+## specify URL for NCI thesaurus - this should always be the most recent? 
+NCItURL <- "https://evs.nci.nih.gov/ftp1/NCI_Thesaurus/Thesaurus.FLAT.zip"
+
+destFlatFilename <- "NCIt_FLAT.zip"
+download.file(url=NCItURL,destfile = destFlatFilename)
+unzip(zipfile = paste0(getwd(),"/",destFlatFilename))
+
+NCIt <- read.table("Thesaurus.txt",header = FALSE, sep = "\t", comment.char = "", fill = TRUE, stringsAsFactors = FALSE, quote = "")
+names(NCIt) <- c("code", "concept_IRI", "parents", 
+                    "synonyms", "definition", "display_name",
+                    "concept_status", "semantic_type", "concept_in_subset")
+## clean up, remove files
+file.remove("NCIt_FLAT.zip")
+file.remove("Thesaurus.txt")
+
+## an entity may have more than one semantic type, so need to multiply rows
+## split and unnest the Class column of NCIt
+NCIt$semantic_type <- strsplit(NCIt$semantic_type, split = "\\|")
+NCIt <- tidyr::unnest(data = NCIt, semantic_type)
+
+## drop rows related to obsolete or retired concepts
+NCIt <- NCIt[grep(pattern = "Retired_Concept|Obsolete_Concept", x=NCIt$concept_status, invert = TRUE), ]
+
+## not all display names are included among synonyms
+## append dsplay names to synonyms
+NCIt$synonyms <- paste0(NCIt$synonyms,"|", NCIt$display_name)
+
+
+
+## split and unnest the synonyms
+NCIt$synonyms <- strsplit(NCIt$synonyms, split = "\\|")
+NCIt <- tidyr::unnest(data = NCIt, synonyms)
+
+## drop unnecessary columns
+NCIt <- dplyr::select(NCIt, code, semantic_type, display_name,  synonyms)
+
+# identify synonyms are ambiguous - i.e. map to more than one entity within a semantic type
+NCIt_multiple_terms <- NCIt %>%
+  group_by(synonyms, semantic_type) %>%
+  summarise(
+    number_terms = length(unique(code))
+  ) %>%
+  filter(number_terms >1) %>%
+  as.data.frame()
+## anti join to delete these rows from the thesaurus
+NCIt <- anti_join(NCIt, NCIt_multiple_terms, by=c("synonyms", "semantic_type"))
+rm(NCIt_multiple_terms)
+
+NCIt <- as.data.frame(NCIt)
+
+## add a column to indicate date downloaded
+# NCIt$downloaded <- Sys.Date()
+
+## drop redundant rows, if any
+NCIt <- unique(NCIt)
+
+## delete any rows that don't contain any letters... 
+NCIt <- NCIt[grep(pattern = "[a-zA-Z]", x=NCIt$synonyms), ]
+
+## just keep drugs... 
+NCIt_drugs <- unique(dplyr::filter(NCIt, semantic_type %in% c("Immunologic Factor", "Pharmacologic Substance", "Clinical Drug", "Steroid", "Hormone")))
+
+rm(NCIt)
+
+## append NCIt to code
+NCIt_drugs <- dplyr::rename(NCIt_drugs, "NCIt_code"="code")
+
+## example
+# dplyr::filter(NCIt_drugs, tolower(synonyms) == tolower("Alpelisib"))
+```
+
+```{r save a dictionary of drug synonyms}
+
+NCI_drug_dictionary <- unique(dplyr::select(NCIt_drugs, NCIt_code, synonyms))
+
+NCI_drug_dictionary$synonyms <- tolower(NCI_drug_dictionary$synonyms)
+
+NCI_drug_dictionary <- unique(NCI_drug_dictionary)
+
+NCI_drug_dictionary <- dplyr::rename(NCI_drug_dictionary, "synonyms_lower"="synonyms")
+
+write.csv(x=NCI_drug_dictionary, file="NCI_drug_dictionary.csv", row.names = FALSE)
+```
+
+```{r map NCIt codes to CHEMBL IDs}
+## NOTE: for a given NCIt entity, some synonyms can map to one CHEMBL ID, but not to others 
+## this causes issues later, we end up with 2 rows for the same NCIt_code
+
+## join to molregno (Internal Primary Key for the molecule)
+NCIt_drugs$synonyms_lower <- tolower(NCIt_drugs$synonyms)
+MOLECULE_SYNONYMS$synonyms_lower <- tolower(MOLECULE_SYNONYMS$synonyms)
+
+
+
+NCIt_to_CHEMBL <- unique(merge(x=dplyr::select(NCIt_drugs, NCIt_code, synonyms_lower), 
+                               by.x = "synonyms_lower", all.x = FALSE, 
+                    y=dplyr::select(MOLECULE_SYNONYMS, molregno, synonyms_lower), 
+                    by.y = "synonyms_lower"))
+
+NCIt_to_CHEMBL <- unique(dplyr::select(NCIt_to_CHEMBL, -synonyms_lower))
+
+## join to CHEMBL_ID (ChEMBL identifier for this compound (for use on web interface etc))
+## also: 
+# MAX_PHASE: Maximum phase of development reached for the compound across all indications (4 = Approved, 3 = Phase 3 Clinical Trials, 2 = Phase 2 Clinical Trials, 1 = Phase 1 Clinical Trials, 0.5 = Early Phase 1 Clinical Trials, -1 = Clinical Phase unknown for drug or clinical candidate drug ie where ChEMBL cannot assign a clinical phase, NULL = preclinical compounds with bioactivity data)
+# BLACK_BOX_WARNING: 	Indicates that the drug has a black box warning (1 = yes, 0 = default value)
+NCIt_to_CHEMBL <- merge(x=NCIt_to_CHEMBL, by.x = "molregno", all.x = TRUE, 
+                    y=dplyr::select(MOLECULE_DICTIONARY, molregno, chembl_id, max_phase, black_box_warning), 
+                    by.y = "molregno")
+
+NCIt_to_CHEMBL$black_box_warning <- as.logical(NCIt_to_CHEMBL$black_box_warning)
+
+```
+
+```{r join drugs to their mechanisms}
+# MECHANISM_OF_ACTION: Description of the mechanism of action e.g., 'Phosphodiesterase 5 inhibitor'
+# ACTION_TYPE:  Type of action of the drug on the target e.g., agonist/antagonist etc (foreign key to action_type table)
+# DISEASE_EFFICACY: Flag to show whether the target assigned is believed to play a role in the efficacy of the drug in the indication(s) for which it is approved (1 = yes, 0 = no)
+# SELECTIVITY_COMMENT: Additional comments regarding the selectivity of the drug
+# TID: Target associated with this mechanism of action (foreign key to target_dictionary table)
+NCIt_to_CHEMBL <- unique(merge(x=NCIt_to_CHEMBL, by.x = "molregno", all.x = TRUE, 
+                    y=dplyr::select(DRUG_MECHANISM, molregno, mechanism_of_action, action_type, disease_efficacy, selectivity_comment, tid), 
+                    by.y = "molregno"))
+
+NCIt_to_CHEMBL$disease_efficacy <- as.logical(NCIt_to_CHEMBL$disease_efficacy)
+
+# PARENT_TYPE: Higher-level grouping of action types e.g., positive vs negative action
+NCIt_to_CHEMBL <- unique(merge(x=NCIt_to_CHEMBL, by.x = "action_type", all.x = TRUE, 
+                    y=dplyr::select(ACTION_TYPE, action_type, "parent_action_type"="parent_type"), 
+                    by.y = "action_type"))
+
+
+```
+
+```{r join drugs to their targets}
+
+
+NCIt_to_CHEMBL <- merge(x=NCIt_to_CHEMBL, by.x = "tid", all.x = TRUE,
+                    y=dplyr::select(TARGET_DICTIONARY, tid, "target_chembl_id"="chembl_id"),
+                    by.y = "tid")
+
+
+NCIt_to_CHEMBL <- merge(x=NCIt_to_CHEMBL, by.x = "tid", all.x = TRUE,
+                    y=dplyr::select(TARGET_COMPONENTS, tid, component_id),
+                    by.y = "tid")
+
+
+NCIt_to_CHEMBL <- merge(x=NCIt_to_CHEMBL, by.x = "component_id", all.x = TRUE,
+                    y=dplyr::select(COMPONENT_SEQUENCES, component_id, organism, accession),
+                    by.y = "component_id")
+
+
+## drop rows related to non-human targets
+NCIt_to_CHEMBL <- dplyr::filter(NCIt_to_CHEMBL, organism == "Homo sapiens" )
+
+
+
+
+## map from UniProt accession numbers to Entrez Symbols
+uniprot_entrez_cols <- c("SYMBOL", "UNIPROT" )
+uniprot_ids <- as.data.frame(AnnotationDbi::select(org.Hs.eg.db, keys=NCIt_to_CHEMBL$accession, columns=uniprot_entrez_cols, keytype="UNIPROT"))
+## merge with mechanisms table
+NCIt_to_CHEMBL <- merge(x=NCIt_to_CHEMBL, by.x = "accession", all.x=TRUE, y=uniprot_ids, by.y = "UNIPROT")
+NCIt_to_CHEMBL <- dplyr::rename(NCIt_to_CHEMBL,"TARGET_SYMBOL"= "SYMBOL")
+
+NCIt_to_CHEMBL <- unique(NCIt_to_CHEMBL)
+```
+
+```{r create drug node list}
+
+drug_nodelist <- unique(dplyr::select(NCIt_to_CHEMBL, NCIt_code, chembl_id, max_phase, black_box_warning  ))
+
+## aggregate one to many relationships
+drug_nodelist <- drug_nodelist %>%
+  group_by(NCIt_code) %>%
+  summarise(
+    chembl_id = paste(unique(na.omit(chembl_id)), collapse = "|"), 
+    max_phase = max(as.numeric(na.omit(max_phase))), ## use maximum
+    black_box_warning = any(black_box_warning)       ## test if any are TRUE
+  ) %>%
+  as.data.frame() %>%
+  unique()
+
+## join to info from NCIt
+drug_nodelist <- unique(merge(
+  x=NCIt_drugs, 
+  by.x = "NCIt_code", 
+  all.x = FALSE, 
+  y= drug_nodelist,
+  by.y = "NCIt_code", 
+  all.y = FALSE
+))
+
+## aggregate one to many relationships
+drug_nodelist <- drug_nodelist %>%
+  group_by(NCIt_code, chembl_id, max_phase, black_box_warning) %>%
+  summarise(
+    semantic_type = paste(unique(na.omit(semantic_type)), collapse = "|"), 
+    display_name = paste(unique(na.omit(display_name)), collapse = "|"),
+    synonyms = paste(unique(na.omit(synonyms)), collapse = "|"),
+  ) %>%
+  as.data.frame() %>%
+  unique()
+
+## reorder columns
+drug_nodelist <- dplyr::select(drug_nodelist, NCIt_code, semantic_type, display_name, synonyms, chembl_id, max_phase, black_box_warning)
+
+
+# drug_nodelist <- NCIt_drugs
+# 
+# ## omit drugs that not mapped to a target
+# drug_nodelist <- drug_nodelist[!is.na(drug_nodelist$TARGET_SYMBOL), ]
+# 
+# ## drop unnecessary columns
+# drug_nodelist <- unique(dplyr::select(drug_nodelist, NCIt_code, semantic_type, display_name, synonyms, chembl_id, max_phase, black_box_warning, max_phase))
+
+# indicate source
+drug_nodelist$source <- "NCIt"
+# indicate refresh date
+drug_nodelist$refresh_date <- today
+
+write.csv(x=drug_nodelist, file = "NCI_drug_nodelist.csv", row.names = FALSE)
+```
+
+
+* Drug node list (`r length(unique(drug_nodelist$NCIt_code))` unique drugs) saved to csv in the following format:  
+  
+`r formattable(head(drug_nodelist))`  
+  
+* e.g. for TAS0612:  
+  
+`r formattable(dplyr::filter(drug_nodelist, NCIt_code == "C175557"))`   
+  
+
+```{r create drug target edge list}
+
+drug_edgelist <- unique(dplyr::select(NCIt_to_CHEMBL, 
+                                      "from"="NCIt_code", "to"="TARGET_SYMBOL", 
+                                      action_type, mechanism_of_action, parent_action_type,
+                                      disease_efficacy))
+
+## aggregate one to many relationships
+drug_edgelist <- drug_edgelist %>%
+  group_by(from, to, parent_action_type) %>%
+  summarise(
+    action_type = paste(unique(na.omit(action_type)), collapse = "|"), 
+    mechanism_of_action = paste(unique(na.omit(mechanism_of_action)), collapse = "|"),
+    disease_efficacy = any(disease_efficacy)
+  ) %>%
+  as.data.frame() %>%
+  unique()
+
+## indicate source of mechanism
+drug_edgelist$source <- "ChEMBL"
+
+## numeric encoding of action type
+drug_edgelist$LINK_FUNCTION <- case_when(
+    drug_edgelist$parent_action_type == "POSITIVE MODULATOR" ~ 1,
+    drug_edgelist$parent_action_type == "NEGATIVE MODULATOR" ~ -1,
+    TRUE ~ 0
+)
+
+## omit drugs that not mapped to a target
+drug_edgelist <- drug_edgelist[!is.na(drug_edgelist$to), ]
+
+# indicate source
+drug_edgelist$source <- "NCIt"
+# indicate refresh date
+drug_edgelist$refresh_date <- today
+
+write.csv(x=drug_edgelist, file = "NCI_drug_edgelist.csv", row.names = FALSE)
+```
+
+* Drug edge list (`r nrow(drug_edgelist)` edges) saved to csv in the following format:  
+  
+`r formattable(head(drug_edgelist))`  
+  
+* e.g. for TAS0612:  
+  
+`r formattable(dplyr::filter(drug_edgelist, from == "C175557"))`   
+      
+```{r disconnect from databases}
+
+dbDisconnect(con)             ## disconnect from CHEMBL DB
+ 
+```
+
+### **Upload CSV files to neo4j server**  
+    
+```{r load credentials from JSON file}
+## load credentials data from JSON file
+neo4j_credentials <- jsonlite::fromJSON(txt = "neo4j_credentials.json")
+
+neo4j_folder_path <- neo4j_credentials$neo4j_folder_path
+neo4j_home_directory_address <- neo4j_credentials$neo4j_home_directory_address
+neo4j_base_url <- neo4j_credentials$neo4j_base_url
+neo4j_username <- neo4j_credentials$neo4j_username
+neo4j_password <- neo4j_credentials$neo4j_password
+
+```
+  
+* Upload csv file over SSH to directory where they can be ingested into neo4j database  
+  
+```{r upload csv files to remote location}
+
+## copy csv files to home directory on remote machine hosting neo4j database... 
+
+csv_filenames <- c("NCI_drug_edgelist.csv", "NCI_drug_nodelist.csv")
+
+for(i in 1:length(csv_filenames)) {
+  filename <- csv_filenames[i]
+  ## copy csv file to home directory on remote maching hosting neo4j database...
+  scp_string1 <- paste0("scp ", 
+                       filename, 
+                       " ",
+                       neo4j_home_directory_address, ":")
+  system(scp_string1)
+  ## sudo copy that file from home directory to correct folder for loading into neo4j...
+  scp_string2 <- paste('ssh', 
+      neo4j_home_directory_address, 
+      '"sudo cp', 
+      filename,
+      neo4j_folder_path,
+      '"',
+      sep = " ")
+  system(scp_string2)
+}
+
+```
+
+### **Connect to remote DB**  
+  
+```{r connection credentials}
+base_url <- neo4j_base_url
+
+username <-  neo4j_username
+password <- neo4j_password
+
+test_query <- "MATCH(g:gene)
+WHERE g.entryACCESSION = 'kegg_3845'
+RETURN g"
+```
+
+```{r run test cypher query using neo4jshell}
+## REQUIRES INSTALLATION OF CYPHER SHELL (in this case, in working directory)
+shell_path <- paste(getwd(), "cypher-shell", "cypher-shell.bat", sep = "/")
+
+## run a test query
+neo4j_query(
+    con = list(address = base_url, uid = username, pwd = password),
+    qry = test_query,
+    shell_path = shell_path,
+    database = "neo4j",
+)
+
+```
+
+### **Merge variant nodes into neo4j DB**  
+  
+```{r load nodelist into neo4j}
+
+path_to_nodes <- "file:///Network_reasoning/NCI_drug_nodelist.csv"
+
+## using apoc.MERGE.node ... 
+## look for each kegg node... 
+## if it doesn't already exist, create one with the defined attributes... 
+## define query
+cypher_MergeNCItNodes <- paste0("LOAD CSV WITH HEADERS FROM '", 
+                                 path_to_nodes,
+                                 "' AS nodes 
+                                 WITH nodes 
+        CALL apoc.merge.node(['drug'],
+            {NCIt_code:nodes.NCIt_code},
+            {semantic_type:nodes.semantic_type, label:nodes.display_name, synonyms:split(nodes.synonyms,'|'), chembl_id:split(nodes.chembl_id,'|'), max_phase:nodes.max_phase, black_box_warning:nodes.black_box_warning, 
+            source:nodes.source, refresh_date:nodes.refresh_date},
+        {semantic_type:nodes.semantic_type, label:nodes.display_name, synonyms:split(nodes.synonyms,'|'), chembl_id:split(nodes.chembl_id,'|'), max_phase:nodes.max_phase, black_box_warning:nodes.black_box_warning, 
+            source:nodes.source, refresh_date:nodes.refresh_date}
+            )
+        YIELD node
+        RETURN null")
+
+                     
+## run query
+neo4j_query(
+    con = list(address = base_url, uid = username, pwd = password),
+    qry = cypher_MergeNCItNodes,
+    shell_path = shell_path,
+    database = "neo4j",
+)
+
+
+
+```
+
+### **Merge KEGG edges into neo4j DB**  
+  
+```{r merge kegg edges into neo4j DB}
+
+path_to_edges <- "file:///Network_reasoning/NCI_drug_edgelist.csv"
+
+## if edges don't exist, create them... 
+cypher_MergeNCItEdges <- paste0("LOAD CSV WITH HEADERS FROM '",path_to_edges,"' AS edges
+                                 MATCH (n1) WHERE edges.from = n1.NCIt_code
+                                 MATCH (n2:gene) WHERE edges.to = n2.entrez_symbol
+                                 CALL {WITH n1, n2, edges
+                                 CALL apoc.merge.relationship(n1,edges.parent_action_type,
+                                {LINK_FUNCTION:edges.LINK_FUNCTION}, 
+                                {action_type:edges.action_type, mechanism_of_action:edges.mechanism_of_action, disease_efficacy:edges.disease_efficacy, source:edges.source, LINK_FUNCTION:edges.LINK_FUNCTION}, 
+                                n2, 
+                                {action_type:edges.action_type, mechanism_of_action:edges.mechanism_of_action, disease_efficacy:edges.disease_efficacy, source:edges.source, LINK_FUNCTION:edges.LINK_FUNCTION}
+                                )
+YIELD rel
+RETURN NULL}
+RETURN null")
+
+## run query
+neo4j_query(
+    con = list(address = base_url, uid = username, pwd = password),
+    qry = cypher_MergeNCItEdges,
+    shell_path = shell_path,
+    database = "neo4j",
+)
+
+
+```
+
+`r knitr::knit_exit()`  
+
+
+
+
+
+
+
+#### **Unused code...**  
+
+  
+```{r NOT USED download NCI thesaurus in csv format}
+
+# 
+# library(R.utils)
+# gunzip("NCIT.csv.gz", remove=FALSE)
+
+```
+
+```{r NOT USED get targets from CHEMBL via BioPortal API}
+## NOT USED, AS UNABLE TO GET ATTRIBUTES SUCH AS Has_Target ... 
+
+# credentials <- jsonlite::fromJSON(txt = "NCBO_credentials.json")
+# API_key <- credentials$API_key
+# url_stem <- "http://data.bioontology.org/"
+# ontology <- "NCIT"
+# query <- "Alpelisib"
+# include <- "all"
+# roots_only <- "true"
+# 
+# API_url <- paste0(url_stem, "search?q=", query, "&ontologies=", ontology, "&roots_only=",roots_only, "&apikey=", API_key)
+# 
+# content(httr::GET(API_url))
+# 
+# purrr::map(API_url, fromJSON)[[1]]$collection
+
+```
+
+
+```{r NOT USED loop through thesaurus and get targets from CHEMBL via API}
+
+# NCIt_drugs$molecule_chembl_id <- NA
+# 
+# ## define components for forming API URL 
+# url_stem <- "https://www.ebi.ac.uk/chembl/api/data/"
+# resource_type <- "molecule"  ## also drug, target, mechanism, drug_indication
+# pref_format <- ".json?"     ## default is xml
+# field_name <- "pref_name"
+# # filter_type <- "__iexact"     ## case-insensitive match
+# filter_type <- "__in"           ## Appears within list of query values
+# equals <- "="
+# select_fields <- "&only="
+# required_fields <- "molecule_chembl_id" 
+# 
+# tic("get chembl IDs for NCIt drugs")
+# for(i in 1:nrow(NCIt_drugs)) {
+#   print(paste0("i = ", i, " of ", nrow(NCIt_drugs)))
+#   # drugname <- NCIt_drugs$display_name[i]
+#   synonyms <- unlist(strsplit(NCIt_drugs$synonyms[i], split = "\\|"))
+#   # if(drugname == "") drugname <- synonyms[1]
+#   chembl_id <- NULL
+#   ## collapse synonyms for passing as a range of query values
+#   search_term <- paste(synonyms, collapse = ",")
+#   ## can't encode spaces in URL so need replace
+#   search_term <- gsub(pattern = " ", replacement = "%20", x = search_term)
+#   ## form url for API
+#   API_url <- paste0(url_stem, resource_type, pref_format, field_name, filter_type, equals, search_term, select_fields, required_fields)
+#   ## call API
+#   chembl_id <- purrr::map(API_url, fromJSON)[[1]]$molecules$molecule_chembl_id
+#   
+#   ## loop through synonyms and call API until you get a non-NULL result
+#   # synonym_num <- 1
+#   # while(is.null(chembl_id)) {
+#   #   print(paste0("trying drug synonym number: ", synonym_num))
+#   #   drug_name <- synonyms[synonym_num]
+#   #   print(paste0("trying drug synonym: ", drug_name))
+#   #   ## can't encode spaces in URL so need replace
+#   #   drug_name_processed <- gsub(pattern = " ", replacement = "%20", x = drug_name)
+#   #   ## get CHEMBL ID for drug
+#   #   search_term <- drug_name_processed
+#   #   ## form url for API
+#   #   API_url <- paste0(url_stem, resource_type, pref_format, field_name, filter_type, equals, search_term, select_fields, required_fields)
+#   #   ## call API
+#   #   chembl_id <- purrr::map(API_url, fromJSON)[[1]]$molecules$molecule_chembl_id
+#   #   #print(chembl_id)
+#   #   
+#   #   ## increment
+#   #   synonym_num = synonym_num + 1
+#   #   if(synonym_num > length(synonyms)) break
+#   # }     ## stop looping through list of synonyms
+#   
+#   if(is.null(chembl_id)) chembl_id <- NA
+#     
+#   print(paste0("chembl id: ", chembl_id))
+#   NCIt_drugs$molecule_chembl_id[i] <- list(chembl_id)
+#   
+#   
+# }
+# toc()
+# ## takes >42 min to run....
+# mean(is.na(NCIt_drugs$molecule_chembl_id))
+# ## fails to find a chembl ID for 38% of drugs
+
+```
+

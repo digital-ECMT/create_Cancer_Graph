@@ -1,0 +1,650 @@
+---
+title: "Generate gene-drug matrix"
+author: "dECMT"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(KEGGlincs)        ## GPL-3
+require(KEGGgraph)        ## GPL >= 2
+require(KEGGREST)         ## Artistic 2.0
+require(dplyr)
+require(tidyr)
+require(formattable)
+require(kableExtra)
+require(stringr)
+require(neo4r)
+require(neo4jshell)
+require(httr)
+require(jsonlite)
+require(reticulate)
+require(purrr)
+require(corpus)
+require(quanteda)
+require(tictoc)
+require(ggplot2)
+```
+
+```{r download variant and drug sets}
+
+variant_nodelist <- read.csv("https://raw.githubusercontent.com/digital-ECMT/network_data/main/variant_nodelist_intogen.csv")
+
+drug_nodelist <- read.csv("https://raw.githubusercontent.com/digital-ECMT/network_data/main/NCI_drug_nodelist.csv")
+
+```
+
+```{r neo4j connection credentials}
+## load credentials data from JSON file
+neo4j_credentials <- jsonlite::fromJSON(txt = "neo4j_credentials.json")
+
+base_url <- neo4j_credentials$neo4j_base_url
+
+username <- neo4j_credentials$neo4j_username
+password <- neo4j_credentials$neo4j_password
+
+## REQUIRES INSTALLATION OF CYPHER SHELL (in this case, in working directory)
+shell_path <- paste(getwd(), "cypher-shell", "cypher-shell.bat", sep = "/")
+
+test_query <- "MATCH(g:gene)
+WHERE g.entryACCESSION = 'kegg_3845'
+RETURN g"
+
+## run a test query
+neo4j_query(
+    con = list(address = base_url, uid = username, pwd = password),
+    qry = test_query,
+    shell_path = shell_path,
+    database = "neo4j",
+)
+
+```
+
+```{r loop through variants, message=FALSE}
+
+variant_effects <- NULL
+
+tic("loop through variants")
+for(i in 1:nrow(variant_nodelist)) {
+  variant_gene <- variant_nodelist$entrez_symbol[i]
+  #print(variant_gene)
+  # print(paste0(i, " of ", nrow(variant_nodelist), " variants"))
+  query <- paste0("MATCH path = (v:variant)-[*1..3]->(g:gene)
+WHERE g.role IN ['TUMOUR SUPPRESSOR', 'ONCOGENE']
+AND none(r IN relationships(path) WHERE r.LINK_FUNCTION = '0')
+AND v.entrez_symbol = '", variant_gene, "'  
+UNWIND relationships(path) AS rel 
+WITH v, g, rel, path 
+RETURN v.label AS source_node, g.entrez_symbol AS affected_gene, g.role AS affected_gene_role, length(path) as pathlength, apoc.agg.product(toInteger(rel.LINK_FUNCTION)) AS link_product")
+  temptable <- neo4j_query(
+    con = list(address = base_url, uid = username, pwd = password),
+    qry = query,
+    shell_path = shell_path,
+    database = "neo4j",
+)
+  if(!is.null(temptable)) variant_effects <- rbind(variant_effects, temptable)
+
+}
+toc()           ## approx 27 minutes for 445 variants...
+variant_effects$source_node_type <- "variant"
+variant_effects$link_product <- as.numeric(variant_effects$link_product)
+variant_effects$pathlength <- as.numeric(variant_effects$pathlength)
+
+## reorder columns
+variant_effects <- dplyr::select(variant_effects, source_node, source_node_type, affected_gene, affected_gene_role, pathlength, link_product)
+## write to csv
+write.csv(x=variant_effects, file = "variant_effects.csv", row.names = FALSE)
+
+```
+
+```{r loop through drugs, message=FALSE}
+
+drug_effects <- NULL
+
+tic("loop through drugs...")
+for(i in 1:nrow(drug_nodelist)) {
+  NCIt_code <- drug_nodelist$NCIt_code[i]
+  # print(NCIt_code)
+  print(paste0(i, " of ", nrow(drug_nodelist), " drugs"))
+  query <- paste0("MATCH path = (d:drug)-[*1..3]->(g:gene)
+WHERE g.role IN ['TUMOUR SUPPRESSOR', 'ONCOGENE']
+AND none(r IN relationships(path) WHERE r.LINK_FUNCTION = '0')
+AND d.NCIt_code = '", NCIt_code, "'  
+UNWIND relationships(path) AS rel 
+WITH d, g, rel, path 
+RETURN d.NCIt_code AS source_node, g.entrez_symbol AS affected_gene, g.role AS affected_gene_role, length(path) as pathlength, apoc.agg.product(toInteger(rel.LINK_FUNCTION)) AS link_product")
+  temptable <- neo4j_query(
+    con = list(address = base_url, uid = username, pwd = password),
+    qry = query,
+    shell_path = shell_path,
+    database = "neo4j",
+)
+  if(!is.null(temptable)) drug_effects <- rbind(drug_effects, temptable)
+
+}
+toc()
+drug_effects$source_node_type <- "treatment"
+drug_effects$link_product <- as.numeric(drug_effects$link_product)
+drug_effects$pathlength <- as.numeric(drug_effects$pathlength)
+## takes approx 3.5 hrs to run for all 4,035 drugs
+## most drugs produce a zero length response.... (only 1,510 of 4,035 drugs produce a non zero response)
+## consider modifying the code to create the network to drop any drugs that don't connect to the network
+
+drug_effects  <- dplyr::select(drug_effects , source_node, source_node_type, affected_gene, affected_gene_role, pathlength, link_product)
+
+## write to csv
+write.csv(x=drug_effects, file = "drug_effects.csv", row.names = FALSE)
+```
+
+```{r bind variant effects and drug effects into single table}
+
+variant_drug_effects <- rbind(variant_effects, drug_effects)
+
+variant_drug_effects$source_node_type <- factor(variant_drug_effects$source_node_type, levels = c("variant", "treatment"))
+```
+
+
+
+
+
+
+
+
+`r knitr::knit_exit()`
+
+
+```{r cypher examples NOT USED}
+## examples.... 
+
+# example_drug_query <- "MATCH path = (d:drug)-[*1..2]->(g:gene)
+# WHERE g.role IN ['TUMOUR SUPPRESSOR', 'ONCOGENE']
+# AND 'Alpelisib' IN d.synonyms
+# RETURN path"
+# 
+# example_variant_query <- "MATCH path = (v:variant)-[*1..2]->(g:gene)
+# WHERE g.role IN ['TUMOUR SUPPRESSOR', 'ONCOGENE']
+# AND v.entrez_symbol = 'KRAS'  
+# RETURN path"
+# 
+# variant_gene <- "KRAS"
+# example_variantlinkproduct_query <- paste0("MATCH path = (v:variant)-[*1..2]->(g:gene)
+# WHERE g.role IN ['TUMOUR SUPPRESSOR', 'ONCOGENE']
+# AND v.entrez_symbol = '", variant_gene, "'  
+# UNWIND relationships(path) AS rel 
+# WITH v, g, rel, path 
+# RETURN v.label AS variant, g.entrez_symbol AS gene, g.role AS gene_role, length(path) as pathlength, apoc.agg.product(toInteger(rel.LINK_FUNCTION)) AS link_product")
+# 
+# ## run a test query
+# neo4j_query(
+#     con = list(address = base_url, uid = username, pwd = password),
+#     qry = example_variantlinkproduct_query,
+#     shell_path = shell_path,
+#     database = "neo4j",
+# )
+```
+
+
+
+
+
+
+
+
+
+
+
+
+```{r join drug effects to variant effects}
+variant_genes <- c("KRAS GoF", "ARID1A LoF", "PIK3CA GoF", "BRAF GoF", "PTEN LoF")
+
+variant_effects %>%
+  dplyr::filter(variant %in% variant_genes)
+
+
+variant_matrix <- variant_effects %>%
+  dplyr::filter(variant %in% variant_genes) %>%
+  reshape2::acast(variant ~ gene, value.var = "link_product", fill = 0)
+variant_matrix
+heatmap(variant_matrix, Colv = NA, Rowv = NA, scale = "none", col = brewer.pal(n = 3, name = "RdBu"))
+
+
+
+
+## combine effects of 1 or more variants
+combined_variant_effects <- variant_effects %>%
+    dplyr::filter(variant %in% variant_genes) %>%
+    mutate("condition"="variants") %>%
+    group_by(condition, gene) %>%
+    summarise(
+        # effect = sum(link_product)     ## assumes additive effect, e.g. PIK3CA doubly active
+        effect = sum(unique(link_product))     ## no additive effect
+    ) %>%
+    as.data.frame()
+
+combined_variant_effects
+
+## do same for selection of drugs
+drug_matrix <- drug_effects %>%
+  dplyr::filter(NCIt_code %in% c("C71146", "C2411", "C1872")) %>%
+  group_by(NCIt_code, gene) %>%
+  summarise(
+    # effect = sum(link_product)     ## assumes additive effect, e.g. PIK3CA doubly active
+    effect = sum(unique(link_product))     ## no additive effect
+  ) %>%
+  as.data.frame()
+  reshape2::acast(NCIt_code ~ gene, value.var = "link_product", fill = 0)
+drug_matrix
+heatmap(drug_matrix, Colv = NA, Rowv = NA, scale = "none", col = brewer.pal(n = 3, name = "RdBu"))
+
+
+
+# ## condense variant effects into a single row
+# combined_variant_matrix <- variant_effects %>%
+#   dplyr::filter(variant %in% variant_genes) %>%
+#   group_by(gene) %>%
+#     summarise(
+#         # net_variant_effect = sum(link_product)     ## assumes additive effect, e.g. PIK3CA doubly active
+#         net_variant_effect = sum(unique(link_product))     ## no additive effect
+#     ) %>%
+#   mutate("condition"="variants") %>%
+#   reshape2::acast(condition ~ gene, value.var = "net_variant_effect", fill = 0)
+# combined_variant_matrix
+# # heatmap(combined_variant_matrix, Colv = NA, Rowv = NA, scale = "none", col = brewer.pal(n = 3, name = "RdBu"))
+
+
+
+
+
+
+  
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# drug_effects %>%
+#     dplyr::filter(NCIt_code %in% alpelisib__code) %>%
+#     group_by(gene, gene_role) %>%
+#     mutate("NCIt_code"=alpelisib__code) %>%
+#     summarise(
+#         drug_effect = sum(unique(link_product))
+#     ) %>%
+#     as.data.frame() %>%
+#     reshape2::acast(NCIt_code ~ gene, value.var = "drug_effect")
+
+
+
+
+
+# ## additive effects of variants on downstream genes
+# variant_effects %>%
+#     dplyr::filter(variant %in% variant_genes) %>%
+#     group_by(gene, gene_role) %>%
+#     summarise(
+#         net_variant_effect = sum(link_product)     ## assumes additive effect, e.g. PIK3CA doubly active
+#     ) %>%
+#     as.data.frame()
+# 
+# ## no additive effects
+# variant_effects %>%
+#     dplyr::filter(variant %in% variant_genes) %>%
+#     group_by(gene, gene_role) %>%
+#     summarise(
+#         net_variant_effect = sum(unique(link_product))     ## assumes no additive effect, e.g. no extra activation of PIK3CA
+#     ) %>%
+#     as.data.frame()
+
+# ## no additive effects, with transposition
+# variant_matrix <- variant_effects %>%
+#     dplyr::filter(variant %in% variant_genes) %>%
+#     group_by(gene, gene_role) %>%
+#     summarise(
+#         net_variant_effect = sum(unique(link_product))
+#     ) %>%
+#     as.data.frame() %>%
+#     reshape2::acast(. ~ gene, value.var = "net_variant_effect", fill = 0)
+# variant_matrix
+
+
+
+
+
+
+
+
+
+
+
+
+
+## with transposition
+variant_effects %>%
+    dplyr::filter(variant %in% variant_genes) %>%
+    mutate("variants" = paste(unique(variant), collapse = " + ")) %>%
+group_by(variants, gene, gene_role) %>%
+    summarise(
+        net_variant_effect = sum(unique(link_product))
+    ) %>%
+    as.data.frame() %>%
+    reshape2::acast(variants ~ gene, value.var = "net_variant_effect")
+
+
+
+## for alpelisib
+drug_effects %>%
+    dplyr::filter(NCIt_code %in% alpelisib__code) %>%
+    group_by(gene, gene_role) %>%
+    mutate("NCIt_code"=alpelisib__code) %>%
+    summarise(
+        drug_effect = sum(unique(link_product))
+    ) %>%
+    as.data.frame() %>%
+    reshape2::acast(NCIt_code ~ gene, value.var = "drug_effect")
+
+
+
+
+## use dist() function
+net_var_effects <- variant_effects %>%
+    dplyr::filter(variant %in% variant_genes) %>%
+    mutate("condition" = "variants") %>%
+group_by(condition, gene) %>%
+    summarise(
+        net_effect = sum(unique(link_product))
+    ) %>%
+    as.data.frame()
+
+alpelisib_effects <- drug_effects %>%
+    dplyr::filter(NCIt_code %in% alpelisib__code) %>%
+    mutate("condition" = "alpelisib") %>%
+group_by(condition, gene) %>%
+    summarise(
+        net_effect = sum(unique(link_product))
+    ) %>%
+    as.data.frame()
+  
+
+net_var_effects %>%
+    rbind(dplyr::filter(alpelisib_effects, gene %in% net_var_effects$gene)) %>%
+    reshape2::acast(condition ~ gene, value.var = "net_effect", fill = 0) %>%
+    dist(method = "manhattan")
+
+  
+  
+```
+
+
+```{r loop through all drugs in drug_effects table}
+
+
+NCIt_codes <- unique(drug_effects$NCIt_code)
+length(NCIt_codes)
+
+
+drug_rankings <- data.frame("NCIt_code"=character(0), distance = numeric(0))
+tic("loop through all drugs in drug effects")
+for(i in 1:length(NCIt_codes)) {
+  print(paste0(i, "/",length(NCIt_codes) ))
+  code <- NCIt_codes[i]
+  # print(code)
+  treatment_effects <- drug_effects %>%
+    dplyr::filter(NCIt_code == code) %>%
+    mutate("condition" = code) %>%
+group_by(condition, gene) %>%
+    summarise(
+        net_effect = sum(unique(link_product))
+    ) %>%
+    as.data.frame()
+
+  treatment_effects <- rbind(net_var_effects, dplyr::filter(treatment_effects, gene %in% net_var_effects$gene)) %>%
+    reshape2::acast(condition ~ gene, value.var = "net_effect", fill = 0) %>%
+    dist(method = "manhattan") %>%
+    as.matrix()
+  
+  # print(treatment_effects)
+  tryCatch({ 
+    distance <- as.numeric(treatment_effects["variants", code]) 
+    drug_rankings <- drug_rankings %>%
+      add_row("NCIt_code"=code, "distance" = distance)} , 
+    error=function(cond) { print("error") }
+  )
+}
+toc()    ## takes approx 2 min for 1,510 NCIt codes.... 
+
+
+
+
+
+```
+
+
+
+
+
+
+
+
+```{r cast into wide format}
+## reshape2::acast converts to a matrix with named rows
+
+
+
+
+## some variants affect genes that no drug currently affects - need to ensure that these are represented... 
+variant_drug_effects_wide <- rbind(dplyr::select(variant_effects, "condition"="variant", gene, link_product), 
+                                   dplyr::select(drug_effects, "condition"="NCIt_code", gene, link_product)) 
+## cast into wide format
+variant_drug_effects_wide <- reshape2::acast(variant_drug_effects_wide, formula = condition ~ gene,
+                  value.var = "link_product",
+                  fun.aggregate = sum)
+
+
+
+
+
+
+
+
+
+variant_effects_wide <- variant_effects %>%
+  reshape2::acast(formula = variant ~ gene,
+                  value.var = "link_product",
+                  fun.aggregate = sum)
+
+
+## drop any columns with all zero values
+# variant_effects_wide[, which(colSums(variant_effects_wide) != 0)]
+
+drug_effects_wide <- drug_effects %>%
+  reshape2::acast(formula = NCIt_code ~ gene,
+                  value.var = "link_product",
+                  fun.aggregate = sum)
+
+
+head(drug_effects_wide[ , intersect(colnames(variant_effects_wide), colnames(drug_effects_wide))])
+
+
+
+
+
+
+
+# variant_oncogenes_wide <- variant_effects %>%
+#   dplyr::filter(gene_role == "ONCOGENE") %>%
+#   reshape2::acast(formula = variant ~ gene,
+#                   value.var = "link_product",
+#                   fun.aggregate = sum)
+# 
+# 
+# drug_oncogenes_wide <- drug_effects %>%
+#   dplyr::filter(gene_role == "ONCOGENE") %>%
+#   reshape2::acast(formula = NCIt_code ~ gene,
+#                   value.var = "link_product",
+#                   fun.aggregate = sum)
+
+## these matrices are very sparse - is converting to wide format necessary, or can we use them in tall format?
+
+```
+
+
+```{r define function to identify and rank treatments}
+
+rankTreatments <- function(variantList, treatmentList) {
+  variantList <- intersect(variantList, row.names(variant_drug_effects_wide))
+  # print(variantList)
+  variantFx <- variant_drug_effects_wide[variantList, ]
+  ## drop any columns with all zero values
+  variantFx <- variantFx[, which(colSums(variantFx) != 0)]
+  print(variantFx)
+  
+  combined_variantFx <- t(as.matrix(colSums(variantFx)))
+  row.names(combined_variantFx) <- "variants"
+  print(combined_variantFx)
+  
+  ## get drugs that affect the genes affected by variants
+  drugFx <- variant_drug_effects_wide[    , intersect(colnames(variantFx), colnames(variant_drug_effects_wide))]
+  
+  ## drop rows related to variant effects
+  # drugFx <- drugFx[!row.names(drugFx) %in% variantList, ]
+  drugFx <- drugFx[row.names(drugFx) %in% unique(drug_effects$NCIt_code)   , ]
+  
+  ## drop any rows with all zero values
+  drugFx <- drugFx[which(rowSums(drugFx) != 0), ]
+  
+  print(head(drugFx))
+  
+  ## vector addition - the more zeroes, the better...
+  print(combined_variantFx)
+  # print(drugFx["C101520", ])
+  print(head(drugFx, 1))
+  variant_drugFx <- as.matrix(combined_variantFx + drugFx["C101520", ])
+  rownames(variant_drugFx) <- "treated"
+  print(variant_drugFx)
+  
+  ## how many elements of variant_drugFx are zero?
+  sum(variant_drugFx == 0)
+}
+
+
+
+```
+
+
+
+
+```{r define rankTreatments function with configurable depth, fig.width=16, fig.height=4}
+# variant_gene_symbols <- c("KRAS", "ARID1A", "PIK3CA", "BRAF", "PTEN")
+treatment_codes <- c("C71146", "C2411", "C1872", "C157493")
+
+rankTreatments2 <- function(variantList, maxDepth=2, treatmentList) {
+  variantFx <- dplyr::filter(variant_effects, variant %in% variantList)  
+  variantFx <- dplyr::filter(variantFx, pathlength <= maxDepth)
+  
+  ## plot to show effect of each variant... 
+  variantsPlot <- ggplot(data=variantFx, aes(x=gene, y=variant, fill = link_product)) +
+    geom_tile(alpha=0.5, color = "black") + 
+    scale_fill_gradient2(midpoint = 0, low = "blue", mid = "white",
+                         high = "red", space = "Lab", name = "Effect of variants", limits = c(-1,1), breaks = c(1, 0, -1), labels = c("Activation", "No effect", "Inactivation") ) +
+    labs(title = paste0("Effect of variants on known tumour drivers (max depth:", maxDepth, ")"), x="Driver genes", y="Variants") +
+    scale_x_discrete(position = "top") 
+  print(variantsPlot)
+  
+  ## treatment effects
+  drugFx <- dplyr::filter(drug_effects, NCIt_code %in% treatmentList)
+  drugFx <- dplyr::filter(drugFx, gene %in% variantFx$gene)
+  
+  ## plot to show effect of each treatment 
+  drugsPlot <- ggplot(data=drugFx, aes(x=gene, y=NCIt_code, fill = link_product)) +
+    geom_tile(alpha=0.5, color = "black") + 
+    scale_fill_gradient2(midpoint = 0, low = "blue", mid = "white",
+                         high = "red", space = "Lab", name = "Effect of treatments", limits = c(-1,1), breaks = c(1, 0, -1), labels = c("Activation", "No effect", "Inactivation") ) +
+    labs(title = paste0("Effect of treatments on tumour drivers (max depth:", maxDepth, ")"), x="Driver genes", y="Treatments") +
+    scale_x_discrete(position = "top") 
+  
+  print(drugsPlot)
+}
+
+rankTreatments2(variant_genes)
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r treatment effect example}
+
+drug_dictionary_url <- "https://raw.githubusercontent.com/digital-ECMT/network_data/main/NCI_drug_dictionary.csv"
+NCI_drug_dictionary <- read.csv(drug_dictionary_url)
+alpelisib__code <- NCI_drug_dictionary$NCIt_code[NCI_drug_dictionary$synonyms_lower == "alpelisib"]
+pik3ca_oncogne_effects <- variant_oncogenes_wide["PIK3CA GoF", ]
+pik3ca_oncogne_effects
+alpelisib_oncogene_effects <- drug_oncogenes_wide[alpelisib__code, ]
+alpelisib_oncogene_effects
+sum(pik3ca_oncogne_effects, alpelisib_oncogene_effects)
+
+
+
+
+
+
+
+# ## rank drugs according to effects against pik3ca on oncogenes
+# tic("loop through drugs and get count activated oncogenes")
+# pik3ca_treatment_rankings <- data.frame("NCTIt_code" = character(0), 
+#                                         "count_activated_oncogenes" = numeric(0))
+# for(i in 1:nrow(drug_oncogenes_wide)) {
+#   NCIt_code <- rownames(drug_oncogenes_wide)[i]
+#   #print(NCIt_code)
+#   drug_oncogene_effect <- drug_oncogenes_wide[NCIt_code, ]
+#   
+#   count_activated_oncogenes <- sum(pik3ca_oncogne_effects, drug_oncogene_effect)
+#   # print(count_activated_oncogenes)
+#   pik3ca_treatment_rankings <- pik3ca_treatment_rankings %>%
+#     add_row("NCTIt_code" = NCIt_code, 
+#             "count_activated_oncogenes" = count_activated_oncogenes)
+# }
+# toc()
+
+```
+
+
+```{r create oncogene effects table}
+
+## start with variant effects
+# oncogene_effects <- unique(dplyr::filter(variant_effects, gene_role == "ONCOGENE"))
+## bind drug effects
+# oncogene_effects <- rbind(oncogene_effects, unique(dplyr::filter(drug_effects, gene_role == "ONCOGENE")))
+# need to make names match.... 
+
+```
+
+
+
+
+
+
+
+

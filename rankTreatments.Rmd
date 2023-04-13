@@ -1,0 +1,117 @@
+---
+title: "Network treatment ranking"
+author: "dECMT"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(ggplot2)
+```
+
+## Objective
+
+* Define a function that accepts a set of variants and a set of treatments (i.e. one or more drugs) and ranks the treatments based on the proportion of variant changes the treatments oppose.  
+  
+```{r download drug and variant effects}
+## effects of variants and drugs on downstream cancer drivers have been precomputed by separate script
+## results were saved to csv and have been uploaded to public github repo... 
+drug_effects_url <- "https://raw.githubusercontent.com/digital-ECMT/network_data/main/drug_effects.csv"
+drug_effects <- read.csv(drug_effects_url, stringsAsFactors = FALSE)
+
+
+variant_effects_url <- "https://raw.githubusercontent.com/digital-ECMT/network_data/main/variant_effects.csv"
+variant_effects <- read.csv(variant_effects_url, stringsAsFactors = FALSE)
+```
+
+
+
+```{r download drug dictionary}
+drug_dictionary_url <- "https://raw.githubusercontent.com/digital-ECMT/network_data/main/NCI_drug_dictionary.csv"
+drug_dictionary <- read.csv(drug_dictionary_url, stringsAsFactors = FALSE)
+```
+
+
+```{r define some example NCIt codes and variants}
+example_NCIt_codes <- c("C71146", "C2411", "C1872", "C157493")
+example_gene_variants <- c("KRAS GoF", "ARID1A LoF", "PIK3CA GoF", "BRAF GoF")
+
+```
+
+```{r define function to rank treatment effects, fig.width=24, fig.height=6}
+
+
+# rankTreatments3 <- function(variantList, maxDepth=2, treatmentList) {
+#   ## get variants and treatments of interest
+#   fx <- dplyr::filter(variant_drug_effects, source_node %in% c(variantList, treatmentList))
+#   ## filter on max depth
+#   fx <- dplyr::filter(fx, pathlength <= maxDepth)
+#   ## create plot to show effects
+#   fx_plot <- ggplot(data=fx, aes(x=affected_gene, y=source_node, fill = link_product/pathlength)) +
+#     geom_tile(color = "black") + 
+#     scale_fill_gradient2(midpoint = 0, low = "blue", mid = "white",
+#                          high = "red", space = "Lab", name = "Effect on tumour driver gene", limits = c(-1,1), breaks = c(1,0.5, 0,-0.5, -1), labels = c("Direct activation", "Indirect activation", "No effect", "Indirect inactivation", "Direct inactivation") ) +
+#     labs(title = paste0("Effect of variants and treatments on known tumour drivers (max depth:", maxDepth, ")"), x="Driver genes", y="Condition") +
+#     scale_x_discrete(position = "top") +
+#     facet_grid(source_node_type ~ affected_gene_role, scales = "free", space = "free") 
+#   print(fx_plot)
+#   
+# }
+# 
+# rankTreatments3(variantList = example_gene_variants, treatmentList = example_NCIt_codes)
+
+
+
+example_patient_table <- data.frame(groupvar = "patient X", 
+                                    groupmembers = c("KRAS GoF", "ARID1A LoF", "PIK3CA GoF", "BRAF GoF"))
+
+example_treatments_table <- data.frame(groupvar = c("Midostaurin", "Sotorasib", "Adagrasib", "Midostaurin + Adagrasib", "Midostaurin + Adagrasib"), 
+                                       groupmembers = c("C1872", "C154287", "C157493", "C1872", "C157493"))
+
+## accept tables instead of vectors
+rankTreatments4 <- function(patientTable, maxDepth=2, treatmentsTable) {
+  variantList <- unique(patientTable [ ,2])
+  treatmentList <- unique(treatmentsTable[ ,2])
+  
+  ## get variants and treatments of interest
+  fx <- dplyr::filter(variant_drug_effects, source_node %in% c(variantList, treatmentList))
+  ## filter on max depth
+  fx <- dplyr::filter(fx, pathlength <= maxDepth)
+  ## create plot to show effects
+  fx_plot <- ggplot(data=fx, aes(x=affected_gene, y=source_node, fill = link_product/pathlength)) +
+    geom_tile(color = "black") + 
+    scale_fill_gradient2(midpoint = 0, low = "blue", mid = "white",
+                         high = "red", space = "Lab", name = "Effect on tumour driver gene", limits = c(-1,1), breaks = c(1,0.5, 0,-0.5, -1), labels = c("Direct activation", "Indirect activation", "No effect", "Indirect inactivation", "Direct inactivation") ) +
+    labs(title = paste0("Effect of variants and treatments on known tumour drivers (max depth:", maxDepth, ")"), x="Driver genes", y="Condition") +
+    scale_x_discrete(position = "top") +
+    facet_grid(source_node_type ~ affected_gene_role, scales = "free", space = "free") 
+  print(fx_plot)
+  
+  grouped_fx <- rbind(patientTable, treatmentsTable) %>%
+    merge(by.x = "groupmembers", y=fx, by.y = "source_node") %>%
+    group_by(groupvar, source_node_type, affected_gene, affected_gene_role) %>%
+    summarise(
+      pathlength = min(pathlength),
+      net_effect = sum(unique(link_product))
+    ) %>%
+    as.data.frame()
+  
+  ## create plot to show effects
+  grouped_fx_plot <- ggplot(data=grouped_fx, aes(x=affected_gene, y=groupvar, fill = net_effect/pathlength)) +
+    geom_tile(color = "black") + 
+    scale_fill_gradient2(midpoint = 0, low = "blue", mid = "white",
+                         high = "red", space = "Lab", name = "Net effect on tumour driver gene", limits = c(-1,1), breaks = c(1,0.5, 0,-0.5, -1), labels = c("Direct activation", "Indirect activation", "No effect", "Indirect inactivation", "Direct inactivation") ) +
+    labs(title = paste0("Net effects of variants and treatments on known tumour drivers (max depth:", maxDepth, ")"), x="Driver genes", y="") +
+    scale_x_discrete(position = "top") +
+    facet_grid(source_node_type ~ affected_gene_role, scales = "free", space = "free")
+  print(grouped_fx_plot)
+  
+}
+
+
+rankTreatments4(patientTable = example_patient_table, treatmentsTable =  example_treatments_table)
+```
+
+
+  
