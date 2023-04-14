@@ -409,8 +409,8 @@ cypher_MergeKeggNodes <- paste0("LOAD CSV WITH HEADERS FROM '",
             activity:nodes.activity,
             deviation:nodes.deviation
             },
-            {refresh_date: nodes.refresh_date, pathway:nodes.pathway},
-            {refresh_date: nodes.refresh_date, pathway:nodes.pathway}
+            {refresh_date: nodes.refresh_date, pathway:split(nodes.pathway,'|')},
+            {refresh_date: nodes.refresh_date, pathway:split(nodes.pathway,'|')}
             )
         YIELD node
         RETURN null")
