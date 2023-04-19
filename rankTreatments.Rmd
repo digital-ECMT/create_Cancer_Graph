@@ -78,7 +78,7 @@ example_treatment_list <- list("VS-6766"  = c("C80060"), "VS-6766 + Everolimus" 
 #                                        groupmembers = c("C1872", "C154287", "C157493", "C1872", "C157493"))
 ```
 
-```{r define function to calculate net effect of variants, fig.width=24, fig.height=8}
+```{r define function to calculate net effect of variants, fig.width=24, fig.height=8, message=FALSE}
 
 calculate_netVariantFx <- function(variantList, maxDepth=2) {
   variantPlot <- variant_effects %>%
@@ -112,7 +112,7 @@ calculate_netVariantFx <- function(variantList, maxDepth=2) {
 netVariants <- calculate_netVariantFx(variantList = example_variant_list)
 ```
 
-```{r define function to calculate net effect of treatments, fig.width=24, fig.height=8}
+```{r define function to calculate net effect of treatments, fig.width=24, fig.height=8, message=FALSE}
 
 calculate_netTreatmentFx <- function(treatmentList, maxDepth=2) {
   # create an empty table that will hold treatment effects
@@ -169,8 +169,63 @@ netTreatments <- calculate_netTreatmentFx(treatmentList = example_treatment_list
 ```{r define treatment ranking function}
 
 
-rankTreatments <- function(variantList, maxDepth=2, treatmentList) {
+rankTreatments <- function(variantList, maxDepth=2, treatmentList, allgenes = FALSE) {
+  variantTable <- variant_effects %>%
+    dplyr::filter(source_node %in% variantList[[1]]) %>%
+    dplyr::filter(pathlength <= maxDepth) %>%
+    mutate("treatment"="none") %>%
+    group_by(treatment, affected_gene) %>%
+    summarise(
+        net_effect = sum(link_product)
+    ) %>%
+    as.data.frame()
   
+  # create an empty table that will hold treatment effects
+  treatment_effects <- drug_effects[0, ] %>%
+    mutate("treatment"=character(0))
+  
+  for(i in 1:length(treatmentList)) {
+    #print(treatmentList[[i]])
+    temp <- drug_effects %>%
+      dplyr::filter(pathlength <= maxDepth) %>%
+      dplyr::filter(source_node %in% treatmentList[[i]]) %>%
+      #dplyr::filter(affected_gene %in% netVariants$affected_gene) %>%
+      mutate("treatment"=names(treatmentList)[i]) 
+    
+    ## bind onto treatment_effects table
+    treatment_effects <- rbind(treatment_effects, temp)
+  }
+  
+  # summarise net effect 
+  treatment_effects <- treatment_effects %>%
+    group_by(treatment, affected_gene) %>%
+    summarise(
+        net_effect = sum(link_product)
+    ) %>%
+    as.data.frame()
+  
+  
+  ## if allgenes = FALSE, ignore genes affected by treatment but not by variants... 
+  if(allgenes == FALSE) {
+    treatment_effects <- dplyr::filter(treatment_effects, affected_gene %in% variantTable$affected_gene)}
+  
+  ## row bind variant and treatment effects and calculate distances
+  treatment_effects %>%
+    rbind(variantTable) %>%
+    mutate(treatment = {relevel(factor(.$treatment), ref="none")}) %>%
+    reshape2::acast(treatment ~ affected_gene, value.var = "net_effect") %>%
+    replace(is.na(.), 0) %>%
+    dist(method = "manhattan")
+  
+  
+  
+  
+  # ## row bind variant and treatment effects and calculate distances
+  # rbind(variantTable, treatment_effects) %>%
+  #   mutate(treatment = {relevel(factor(.$treatment), ref="none")}) %>%
+  #   reshape2::acast(treatment ~ affected_gene, value.var = "net_effect") %>%
+  #   replace(is.na(.), 0) %>%
+  #   dist(method = "manhattan")
 
 }
 
